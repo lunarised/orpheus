@@ -74,16 +74,8 @@ fn spotify_playback_started(
 }
 
 fn local_day_and_hour() -> Option<(i32, u8)> {
-    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as libc::time_t;
-    let mut local: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
-        return None;
-    }
-    let day = local
-        .tm_year
-        .saturating_mul(400)
-        .saturating_add(local.tm_yday);
-    Some((day, u8::try_from(local.tm_hour).ok()?))
+    let local = crate::local_time::LocalDateTime::now()?;
+    Some((local.day_key(), local.hour))
 }
 
 fn take_ready_visualizer_frame(
