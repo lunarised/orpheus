@@ -1180,6 +1180,18 @@ impl AppState {
                 );
             }
             WebConfigUpdate::PlayPlaylist(entry) => self.start_playlist(entry),
+            WebConfigUpdate::QueuePlaylist {
+                entry,
+                requested_by,
+            } => {
+                if let Err(error) = self.mopidy_commands.send(MopidyCommand::QueuePlaylist {
+                    uri: entry.uri,
+                    display_name: entry.name,
+                    requested_by,
+                }) {
+                    eprintln!("Failed to send playlist queue command: {error}");
+                }
+            }
             WebConfigUpdate::QueueTrack {
                 uri,
                 placement,
@@ -2883,6 +2895,31 @@ mod tests {
                 uri: "test:playlist:web".to_string(),
                 display_name: "Web playlist".to_string(),
                 shuffle: true,
+            }
+        );
+    }
+
+    #[test]
+    fn web_playlist_queue_appends_without_switching_playback_source() {
+        let (mut state, commands, _updates) = AppState::new_for_test(Config::default());
+        state.active_source = PlaybackSource::Spotifyd;
+
+        state.apply_web_config_update(WebConfigUpdate::QueuePlaylist {
+            entry: PlaylistEntry {
+                name: "Guest mix".to_string(),
+                uri: "test:playlist:guest-mix".to_string(),
+                art_uri: None,
+            },
+            requested_by: Some("Sam".to_string()),
+        });
+
+        assert_eq!(state.active_source, PlaybackSource::Spotifyd);
+        assert_eq!(
+            commands.recv().unwrap(),
+            MopidyCommand::QueuePlaylist {
+                uri: "test:playlist:guest-mix".to_string(),
+                display_name: "Guest mix".to_string(),
+                requested_by: Some("Sam".to_string()),
             }
         );
     }
