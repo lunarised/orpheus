@@ -1,0 +1,44 @@
+[package]
+name = "orpheus"
+version = "0.1.0"
+edition = "2024"
+default-run = "orpheus"
+autobins = false
+
+[[bin]]
+name = "orpheus"
+path = "src/main.rs"
+
+[[bin]]
+name = "orpheus-splash"
+path = "src/bin/orpheus_splash.rs"
+
+[[bin]]
+name = "orpheus-audio-bridge"
+path = "src/bin/orpheus_audio_bridge.rs"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:minifb"]
+hardware = ["dep:rppal"]
+
+[dependencies]
+image = "0.25"
+fontdue = "0.9"
+tiny-skia = "0.11"
+libc = "0.2"
+
+# Mopidy JSON-RPC client
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+url = "2"
+dbus = "0.9"
+qrcodegen = "1.8"
+
+# Desktop preview (default)
+minifb = { version = "0.28", optional = true }
+
+# Pi 5 hardware display
+rppal = { version = "0.19", optional = true }

@@ -1,0 +1,23 @@
+/target/
+
+# Runtime configuration and state. These files may contain credentials or
+# details about the local network and media library.
+/settings.toml
+/playlists.toml
+/queue-state.toml
+/playback-history.toml
+
+# Runtime and generated assets.
+/fonts/
+/art_cache/
+/orpheus-preview.png
+/orpheus-splash-preview.png
+*.log
+
+# Local development settings.
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*~
