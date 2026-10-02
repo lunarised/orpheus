@@ -4,6 +4,7 @@ mod config;
 #[cfg(feature = "hardware")]
 mod display;
 mod history;
+mod local_time;
 mod mopidy;
 mod news;
 mod playlists;

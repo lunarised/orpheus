@@ -1855,30 +1855,18 @@ impl Renderer {
 }
 
 fn local_clock_strings() -> Option<(String, String)> {
-    let timestamp = unsafe { libc::time(std::ptr::null_mut()) };
-    if timestamp < 0 {
-        return None;
-    }
-    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-    // SAFETY: `timestamp` and `local` are valid pointers for the duration of
-    // this call, and `localtime_r` initializes `local` before returning it.
-    let result = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
-    if result.is_null() {
-        return None;
-    }
-    // SAFETY: a non-null result from `localtime_r` means the struct was filled.
-    let local = unsafe { local.assume_init() };
+    let local = crate::local_time::LocalDateTime::now()?;
 
     const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let weekday = WEEKDAYS.get(local.tm_wday as usize)?;
-    let month = MONTHS.get(local.tm_mon as usize)?;
+    let weekday = WEEKDAYS.get(usize::from(local.weekday))?;
+    let month = MONTHS.get(usize::from(local.month.checked_sub(1)?))?;
 
     Some((
-        format!("{:02}:{:02}", local.tm_hour, local.tm_min),
-        format!("{weekday} {} {month}", local.tm_mday),
+        format!("{:02}:{:02}", local.hour, local.minute),
+        format!("{weekday} {} {month}", local.day),
     ))
 }
 
