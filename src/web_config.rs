@@ -104,6 +104,8 @@ const APP_JS: &str = r#"(() => {
   const next = get('next-track');
   const screenToggle = get('toggle-screen');
   const carouselStatus = get('carousel-status');
+  const sleepTimerStatus = get('sleep-timer-status');
+  const sleepTimerCancel = get('sleep-timer-cancel');
   const volume = get('playback-volume');
   const volumeLabel = get('volume-label');
   const playbackForm = get('playback-form');
@@ -514,6 +516,15 @@ const APP_JS: &str = r#"(() => {
       const speed = Math.max(0, Number(playback.carousel_speed) || 0);
       carouselStatus.textContent = `${count} album cover${count === 1 ? '' : 's'} ready · ${Math.round(speed)} px/s`;
     }
+    if (sleepTimerStatus) {
+      const remaining = playback.sleep_timer_remaining_seconds;
+      const active = remaining !== null && remaining !== undefined;
+      sleepTimerStatus.textContent = active
+        ? `Playback stops in ${formatTime(remaining)}${playback.sleep_timer_fading ? ' · fading gently' : ''}`
+        : 'No timer active';
+      sleepTimerStatus.classList.toggle('active', active);
+      if (sleepTimerCancel) sleepTimerCancel.hidden = !active;
+    }
 
     if (playback.volume !== null && playback.volume !== undefined) {
       const maximum = Math.max(10, Math.min(100, Number(playback.max_volume) || 100));
@@ -555,7 +566,7 @@ const APP_JS: &str = r#"(() => {
   };
 
   const sendAction = async (action, fields = {}) => {
-    if (action !== 'screensaver' && latestPlayback.online === false) {
+    if (!['screensaver', 'sleep_cancel'].includes(action) && latestPlayback.online === false) {
       showFeedback(`${latestPlayback.source || 'Playback source'} is unavailable`, true);
       return false;
     }
@@ -567,7 +578,7 @@ const APP_JS: &str = r#"(() => {
         body
       });
       if (!response.ok) throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
-      const label = action === 'seek' ? `Seeking to ${formatTime(fields.position_seconds)}` : action === 'volume' ? `Volume ${fields.volume}%` : action === 'screensaver' ? 'Display command sent' : 'Command sent';
+      const label = action === 'seek' ? `Seeking to ${formatTime(fields.position_seconds)}` : action === 'volume' ? `Volume ${fields.volume}%` : action === 'screensaver' ? 'Display command sent' : action === 'sleep_cancel' ? 'Sleep timer cancelled' : action.startsWith('sleep_') ? `Sleep timer set for ${action.slice(6)} minutes` : 'Command sent';
       showFeedback(label);
       if (action !== 'volume') window.setTimeout(refresh, 150);
       return true;
@@ -981,6 +992,8 @@ pub enum WebPlaybackAction {
     Seek(u64),
     SetVolume(u8),
     ToggleScreensaver,
+    StartSleepTimer(u64),
+    CancelSleepTimer,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1005,6 +1018,8 @@ pub struct WebPlaybackStatus {
     pub screensaver_active: bool,
     pub carousel_cover_count: usize,
     pub carousel_speed: f64,
+    pub sleep_timer_remaining_seconds: Option<u64>,
+    pub sleep_timer_fading: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1036,6 +1051,8 @@ impl Default for WebPlaybackStatus {
             screensaver_active: false,
             carousel_cover_count: 0,
             carousel_speed: Settings::default().carousel_speed,
+            sleep_timer_remaining_seconds: None,
+            sleep_timer_fading: false,
         }
     }
 }
@@ -1723,6 +1740,8 @@ struct PublicStatusSummary {
     progress_percent: Option<f64>,
     volume_percent: Option<u8>,
     max_volume_percent: u8,
+    sleep_timer_remaining_seconds: Option<u64>,
+    sleep_timer_fading: bool,
     clients: usize,
     queue_length: usize,
     queue_upcoming: usize,
@@ -1808,7 +1827,7 @@ fn collect_public_status(server: &WebServerState) -> PublicStatusSummary {
         healthy: playback.online,
         state,
         source: playback.source.clone(),
-        track: has_track.then(|| PublicStatusTrack {
+        track: has_track.then_some(PublicStatusTrack {
             title: playback.title,
             artist: playback.artist,
             album: playback.album,
@@ -1818,6 +1837,8 @@ fn collect_public_status(server: &WebServerState) -> PublicStatusSummary {
         progress_percent,
         volume_percent: playback.volume,
         max_volume_percent: playback.max_volume,
+        sleep_timer_remaining_seconds: playback.sleep_timer_remaining_seconds,
+        sleep_timer_fading: playback.sleep_timer_fading,
         clients: server.active_clients.load(Ordering::Relaxed),
         queue_length: queue.len(),
         queue_upcoming: queue.iter().filter(|track| !track.current).count(),
@@ -2184,6 +2205,12 @@ fn send_playback_request(
         "seek" => WebPlaybackAction::Seek(integer(&form, "position_seconds", 0, 7 * 24 * 60 * 60)?),
         "volume" => WebPlaybackAction::SetVolume(integer(&form, "volume", 0, 100)? as u8),
         "screensaver" => WebPlaybackAction::ToggleScreensaver,
+        "sleep_15" => WebPlaybackAction::StartSleepTimer(15),
+        "sleep_30" => WebPlaybackAction::StartSleepTimer(30),
+        "sleep_45" => WebPlaybackAction::StartSleepTimer(45),
+        "sleep_60" => WebPlaybackAction::StartSleepTimer(60),
+        "sleep_90" => WebPlaybackAction::StartSleepTimer(90),
+        "sleep_cancel" => WebPlaybackAction::CancelSleepTimer,
         _ => return Err("unknown playback action".to_string()),
     };
     updates
@@ -2783,12 +2810,12 @@ main{position:relative;width:min(1040px,calc(100% - 32px));margin:0 auto;padding
 label{display:grid;gap:7px;color:#cbd0dc;font-size:12px;font-weight:650}input,select{width:100%;border:1px solid var(--line);border-radius:12px;background:rgba(5,8,14,.72);color:#fff;padding:11px 13px;font:inherit;transition:border-color .18s,box-shadow .18s}input:focus,select:focus{outline:0;border-color:rgba(138,180,248,.75);box-shadow:0 0 0 4px rgba(138,180,248,.12)}input[type="range"]{accent-color:var(--accent);padding:8px 0}.check{display:flex;align-items:center;gap:9px;padding-top:24px}.check input{width:auto;accent-color:var(--accent)}
 button{border:0;border-radius:12px;background:linear-gradient(135deg,var(--accent),#bad4ff);color:#07101e;font:inherit;font-weight:800;padding:11px 18px;cursor:pointer;margin-top:18px;box-shadow:0 8px 22px rgba(78,125,194,.18);transition:transform .16s ease,filter .16s ease,opacity .16s}button:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.07)}button:active:not(:disabled){transform:translateY(0)}button:disabled{cursor:not-allowed;opacity:.42}.button-subtle{background:rgba(255,255,255,.07);box-shadow:none;color:#d8deec}.button-danger{background:rgba(255,103,126,.11);box-shadow:none;color:#ffabb7}
 .status{display:inline-flex;align-items:center;padding:6px 10px;border:1px solid rgba(115,226,167,.22);border-radius:999px;background:rgba(115,226,167,.08);color:var(--good);font-size:11px;font-weight:750}.status:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:7px;box-shadow:0 0 10px currentColor}.status.offline{color:var(--muted);border-color:var(--line);background:rgba(255,255,255,.03)}[hidden]{display:none!important}
-.now-playing-body{display:flex;align-items:center;gap:22px}.now-playing-details{flex:1;min-width:0}.album-art-wrap{width:148px;aspect-ratio:1;flex:0 0 148px;border-radius:18px;overflow:hidden;background:#0a0d14;border:1px solid var(--line);box-shadow:0 18px 45px rgba(0,0,0,.4)}.album-art{display:block;width:100%;height:100%;object-fit:cover}.track-title{font-size:27px;line-height:1.15;font-weight:820;letter-spacing:-.035em;margin:3px 0 7px}.track-meta{color:var(--muted)}.web-progress{height:8px;background:rgba(255,255,255,.09);border-radius:99px;overflow:hidden;margin-top:22px;cursor:pointer}.web-progress:focus-visible{outline:2px solid var(--accent);outline-offset:4px}.web-progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-2));width:0;transition:width .25s linear;pointer-events:none}.playback-time{display:flex;justify-content:space-between;color:#747d91;font-size:11px;margin-top:7px}.next-track{color:#bbc2d2;font-size:12px;margin-top:12px}.controls{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:19px}.controls button{margin:0}.controls button:not(:nth-child(2)){background:rgba(255,255,255,.065);box-shadow:none;color:#dbe1ed}.volume-row{display:grid;grid-template-columns:1fr auto;align-items:end;gap:10px;margin-top:17px}.volume-row button{margin:0}.js .volume-row button{display:none}.display-tools{display:flex;align-items:center;gap:12px;margin-top:15px}.display-tools button{margin:0;background:rgba(138,180,248,.1);box-shadow:none;color:#cfe0ff}.display-tools span{color:var(--muted);font-size:11px}.command-feedback{min-height:18px;color:var(--good);font-size:12px;margin-top:10px}.command-feedback.error{color:var(--danger)}.shortcuts{font-size:10px;margin-top:2px}
+.now-playing-body{display:flex;align-items:center;gap:22px}.now-playing-details{flex:1;min-width:0}.album-art-wrap{width:148px;aspect-ratio:1;flex:0 0 148px;border-radius:18px;overflow:hidden;background:#0a0d14;border:1px solid var(--line);box-shadow:0 18px 45px rgba(0,0,0,.4)}.album-art{display:block;width:100%;height:100%;object-fit:cover}.track-title{font-size:27px;line-height:1.15;font-weight:820;letter-spacing:-.035em;margin:3px 0 7px}.track-meta{color:var(--muted)}.web-progress{height:8px;background:rgba(255,255,255,.09);border-radius:99px;overflow:hidden;margin-top:22px;cursor:pointer}.web-progress:focus-visible{outline:2px solid var(--accent);outline-offset:4px}.web-progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-2));width:0;transition:width .25s linear;pointer-events:none}.playback-time{display:flex;justify-content:space-between;color:#747d91;font-size:11px;margin-top:7px}.next-track{color:#bbc2d2;font-size:12px;margin-top:12px}.controls{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:19px}.controls button{margin:0}.controls button:not(:nth-child(2)){background:rgba(255,255,255,.065);box-shadow:none;color:#dbe1ed}.volume-row{display:grid;grid-template-columns:1fr auto;align-items:end;gap:10px;margin-top:17px}.volume-row button{margin:0}.js .volume-row button{display:none}.display-tools{display:flex;align-items:center;gap:12px;margin-top:15px}.display-tools button{margin:0;background:rgba(138,180,248,.1);box-shadow:none;color:#cfe0ff}.display-tools span{color:var(--muted);font-size:11px}.sleep-timer{display:grid;gap:10px;margin-top:15px;padding:13px;border:1px solid var(--line);border-radius:14px;background:rgba(5,8,14,.4)}.sleep-timer-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.sleep-timer-head strong{font-size:12px}.sleep-timer-status{color:var(--muted);font-size:11px}.sleep-timer-status.active{color:var(--good)}.sleep-timer-actions{display:grid;grid-template-columns:repeat(6,1fr);gap:6px}.sleep-timer-actions button{margin:0;padding:8px 7px;background:rgba(255,255,255,.065);box-shadow:none;color:#dbe1ed;font-size:11px}.sleep-timer-actions .button-danger{color:#ffabb7;background:rgba(255,103,126,.11)}.command-feedback{min-height:18px;color:var(--good);font-size:12px;margin-top:10px}.command-feedback.error{color:var(--danger)}.shortcuts{font-size:10px;margin-top:2px}
 .notice{padding:12px 15px;border-radius:12px;background:rgba(115,226,167,.1);color:#aaf0c8;border:1px solid rgba(115,226,167,.22)}.playlist{border-top:1px solid var(--line);padding:17px 0 4px}.playlist:first-of-type{border-top:0;padding-top:0}.playlist-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.playlist-launch,.library-search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}.playlist-launch label+label{margin-top:12px}.playlist-launch button,.library-search-form button{margin:0;height:46px}.playlist-select{min-height:178px}.playlist-count{font-size:11px;color:var(--muted)}
 .search-results{display:grid;gap:8px;margin-top:14px}.search-result,.history-item{display:flex;align-items:center;justify-content:space-between;gap:14px}.search-result,.queue-item,.history-item{padding:13px;border:1px solid var(--line);border-radius:14px;background:rgba(5,8,14,.46)}.queue-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px}.queue-item.current{border-color:rgba(138,180,248,.5);background:rgba(138,180,248,.08)}.search-result-copy{display:grid;gap:4px;min-width:0}.queue-item-copy{width:100%;overflow:hidden}.search-result-copy strong,.search-result-copy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.search-result-copy span{color:var(--muted);font-size:11px}.search-actions,.queue-actions,.queue-controls{display:flex;align-items:center;gap:6px;flex:0 0 auto}.search-actions button,.queue-actions button,.browse-item{margin:0;padding:8px 10px;background:rgba(255,255,255,.07);box-shadow:none;color:#cfe0ff;font-size:11px}.search-actions button:first-child{background:linear-gradient(135deg,var(--accent),#bad4ff);color:#07101e}.browse-toolbar{display:grid;grid-template-columns:160px 1fr;gap:10px}.browse-items{display:flex;gap:7px;overflow:auto;padding:10px 0 3px}.browse-item{white-space:nowrap}.queue-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.queue-heading button{margin:0}.queue-list,.history-list{display:grid;gap:8px;margin-top:14px}.diagnostic-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.diagnostic{padding:14px;border:1px solid var(--line);border-radius:14px;background:rgba(5,8,14,.46)}.diagnostic span{display:block;color:var(--muted);font-size:11px}.diagnostic strong{display:block;margin-top:4px;font-size:17px}.hint{font-size:11px}.install-actions,.settings-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.install-actions button,.settings-actions button{margin:10px 0 0}.install-status{flex:1;min-width:220px}.security-note{display:flex;gap:12px;align-items:flex-start;padding:13px;border:1px solid rgba(138,180,248,.15);border-radius:13px;background:rgba(138,180,248,.055)}.security-note strong{display:block;margin-bottom:2px}.login-shell{width:min(430px,calc(100% - 32px));padding-top:9vh}.login-card{padding:28px}.login-card h2{font-size:25px;margin-bottom:6px}.login-card button{width:100%}.login-error{color:var(--danger);margin:12px 0}.footer{font-size:11px;text-align:center;margin-top:26px}.footer a{color:#aebddd}
 .queue-vote{flex:0 0 88px;width:88px;white-space:nowrap;margin:0;padding:8px 10px;box-shadow:none;color:var(--good);background:rgba(115,226,167,.08);font-size:11px}.client-identity{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:rgba(5,8,14,.42)}.client-identity span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.client-identity strong{display:block;margin-top:1px}.client-identity button{margin:0;padding:7px 10px;background:rgba(255,255,255,.07);box-shadow:none;color:#d8deec;font-size:11px}
 @media(display-mode:standalone){main{padding-top:max(24px,env(safe-area-inset-top));padding-bottom:max(32px,env(safe-area-inset-bottom))}}
-@media(max-width:700px){main{width:min(100% - 22px,1040px);padding-top:18px}.app-header{align-items:flex-start;flex-direction:column}.tabs{width:100%;overflow:auto}.tabs a{flex:1;text-align:center;white-space:nowrap}.grid,.diagnostic-grid{grid-template-columns:1fr}.check{padding-top:0}.volume-row,.playlist-launch,.library-search-form,.browse-toolbar{grid-template-columns:1fr}.search-result,.history-item{align-items:stretch;flex-direction:column}.queue-item{grid-template-columns:1fr;align-items:stretch}.search-actions{display:grid;grid-template-columns:repeat(3,1fr)}.queue-controls{display:grid;grid-template-columns:1fr;width:100%}.queue-actions{display:grid;grid-template-columns:repeat(4,1fr)}.queue-vote{width:100%}.now-playing-body{gap:14px}.album-art-wrap{width:100px;flex-basis:100px}.track-title{font-size:21px}.card{padding:17px;border-radius:17px}.brand-mark{width:40px;height:40px}.shortcuts{display:none}}
+@media(max-width:700px){main{width:min(100% - 22px,1040px);padding-top:18px}.app-header{align-items:flex-start;flex-direction:column}.tabs{width:100%;overflow:auto}.tabs a{flex:1;text-align:center;white-space:nowrap}.grid,.diagnostic-grid{grid-template-columns:1fr}.check{padding-top:0}.volume-row,.playlist-launch,.library-search-form,.browse-toolbar{grid-template-columns:1fr}.search-result,.history-item{align-items:stretch;flex-direction:column}.queue-item{grid-template-columns:1fr;align-items:stretch}.search-actions{display:grid;grid-template-columns:repeat(3,1fr)}.queue-controls{display:grid;grid-template-columns:1fr;width:100%}.queue-actions{display:grid;grid-template-columns:repeat(4,1fr)}.queue-vote{width:100%}.sleep-timer-actions{grid-template-columns:repeat(3,1fr)}.now-playing-body{gap:14px}.album-art-wrap{width:100px;flex-basis:100px}.track-title{font-size:21px}.card{padding:17px;border-radius:17px}.brand-mark{width:40px;height:40px}.shortcuts{display:none}}
 "#;
 
 fn page_start(active_page: &str) -> String {
@@ -2868,7 +2895,7 @@ fn render_player_page(
             csrf_token,
         ));
     }
-    html.push_str("<p class=\"footer\">Local multi-client player · <a href=\"/health\">health</a></p></main><script src=\"/app.js?v=9\" defer></script><script src=\"/pwa.js\" defer></script></body></html>");
+    html.push_str("<p class=\"footer\">Local multi-client player · <a href=\"/health\">health</a></p></main><script src=\"/app.js?v=10\" defer></script><script src=\"/pwa.js\" defer></script></body></html>");
     html
 }
 
@@ -3450,6 +3477,46 @@ fn playback_card(playback: &WebPlaybackStatus, csrf_token: &str, controls_allowe
         .as_ref()
         .map(|_| format!("Album artwork for {}", playback.title))
         .unwrap_or_default();
+    let sleep_timer_controls = if controls_allowed {
+        let timer_status = playback
+            .sleep_timer_remaining_seconds
+            .map(|seconds| {
+                format!(
+                    "Playback stops in {}{}",
+                    format_web_time(seconds as f64),
+                    if playback.sleep_timer_fading {
+                        " · fading gently"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .unwrap_or_else(|| "No timer active".to_string());
+        let active_class = if playback.sleep_timer_remaining_seconds.is_some() {
+            " active"
+        } else {
+            ""
+        };
+        let cancel_hidden = if playback.sleep_timer_remaining_seconds.is_some() {
+            ""
+        } else {
+            " hidden"
+        };
+        format!(
+            "<div class=\"sleep-timer\"><div class=\"sleep-timer-head\"><strong>Sleep timer</strong><span id=\"sleep-timer-status\" class=\"sleep-timer-status{}\">{}</span></div>\
+             <div class=\"sleep-timer-actions\"><button data-playback-control data-admin-control type=\"submit\" name=\"action\" value=\"sleep_15\"{}>15 min</button><button data-playback-control data-admin-control type=\"submit\" name=\"action\" value=\"sleep_30\"{}>30 min</button><button data-playback-control data-admin-control type=\"submit\" name=\"action\" value=\"sleep_45\"{}>45 min</button><button data-playback-control data-admin-control type=\"submit\" name=\"action\" value=\"sleep_60\"{}>1 hour</button><button data-playback-control data-admin-control type=\"submit\" name=\"action\" value=\"sleep_90\"{}>90 min</button><button id=\"sleep-timer-cancel\" class=\"button-danger\" data-admin-control type=\"submit\" name=\"action\" value=\"sleep_cancel\"{}>Cancel</button></div></div>",
+            active_class,
+            escape_html(&timer_status),
+            playback_disabled,
+            playback_disabled,
+            playback_disabled,
+            playback_disabled,
+            playback_disabled,
+            cancel_hidden,
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         "<section class=\"card\"><div class=\"playing-head\"><h2>Now playing</h2><span id=\"playback-status\" class=\"{}\">{}</span></div>\
@@ -3464,7 +3531,7 @@ fn playback_card(playback: &WebPlaybackStatus, csrf_token: &str, controls_allowe
          <button data-playback-control data-admin-control type=\"submit\" name=\"action\" value=\"next\"{}>Next</button></div>\
          <div class=\"volume-row\"><label><span id=\"volume-label\">Volume ({}%)</span><input id=\"playback-volume\" data-playback-control type=\"range\" name=\"volume\" value=\"{}\" min=\"0\" max=\"{}\" step=\"1\"{}></label>\
          <button data-playback-control type=\"submit\" name=\"action\" value=\"volume\"{}>Set volume</button></div>\
-         <div class=\"display-tools\"><button id=\"toggle-screen\" data-admin-control type=\"submit\" name=\"action\" value=\"screensaver\"{}>{}</button><span id=\"carousel-status\">{}</span></div></form>\
+         <div class=\"display-tools\"><button id=\"toggle-screen\" data-admin-control type=\"submit\" name=\"action\" value=\"screensaver\"{}>{}</button><span id=\"carousel-status\">{}</span></div>{}</form>\
          <div id=\"command-feedback\" class=\"command-feedback\" aria-live=\"polite\"></div><p class=\"shortcuts\">Shortcuts: Space play/pause · ←/→ seek 10s · ↑/↓ volume · N/P tracks · S screen</p></section>",
         status_class,
         escape_html(&status_text),
@@ -3493,6 +3560,7 @@ fn playback_card(playback: &WebPlaybackStatus, csrf_token: &str, controls_allowe
         screen_disabled,
         screen_toggle_label,
         escape_html(&cover_label),
+        sleep_timer_controls,
     )
 }
 
@@ -4144,6 +4212,21 @@ mod tests {
             received.recv().unwrap(),
             WebConfigUpdate::Playback(WebPlaybackAction::ToggleScreensaver)
         ));
+        send_playback_request(&request("csrf=token&action=sleep_45"), "token", &updates).unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            WebConfigUpdate::Playback(WebPlaybackAction::StartSleepTimer(45))
+        ));
+        send_playback_request(
+            &request("csrf=token&action=sleep_cancel"),
+            "token",
+            &updates,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            WebConfigUpdate::Playback(WebPlaybackAction::CancelSleepTimer)
+        ));
         assert!(
             send_playback_request(
                 &request("csrf=token&action=volume&volume=101"),
@@ -4702,6 +4785,7 @@ mod tests {
         );
         assert!(page.contains("value=\"next\" disabled>Next"));
         assert!(page.contains("value=\"screensaver\" disabled>Preview screensaver"));
+        assert!(!page.contains("id=\"sleep-timer-status\""));
 
         let post = |track: &str| {
             HttpRequest {
@@ -4803,6 +4887,20 @@ mod tests {
                 .starts_with("HTTP/1.1 403 Forbidden\r\n")
         );
 
+        let mut sleep_timer = Vec::new();
+        dispatch_request_for_client(
+            &mut sleep_timer,
+            playback_post("action=sleep_30"),
+            &server,
+            "192.0.2.10",
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(sleep_timer)
+                .unwrap()
+                .starts_with("HTTP/1.1 403 Forbidden\r\n")
+        );
+
         std::fs::remove_file(settings_path).unwrap();
     }
 
@@ -4832,6 +4930,8 @@ mod tests {
             screensaver_active: true,
             carousel_cover_count: 12,
             carousel_speed: 35.0,
+            sleep_timer_remaining_seconds: Some(1_800),
+            sleep_timer_fading: false,
         };
         let player_html = render_player_page(&playback, &[], "token", None, false, 120);
         let settings_html = render_settings_page(&settings, &Config::default(), "token", None);
@@ -4850,7 +4950,9 @@ mod tests {
         assert!(player_html.contains(">Wake display</button>"));
         assert!(player_html.contains("12 album covers ready · 35 px/s"));
         assert!(player_html.contains("id=\"playback-progress\""));
-        assert!(player_html.contains("src=\"/app.js?v=9\""));
+        assert!(player_html.contains("src=\"/app.js?v=10\""));
+        assert!(player_html.contains("id=\"sleep-timer-status\""));
+        assert!(player_html.contains("Playback stops in 30:00"));
         assert!(player_html.contains("id=\"identity-gate\""));
         assert!(player_html.contains("id=\"client-name-label\""));
         assert!(player_html.contains("<main inert"));
@@ -4907,6 +5009,8 @@ mod tests {
             screensaver_active: true,
             carousel_cover_count: 12,
             carousel_speed: 28.0,
+            sleep_timer_remaining_seconds: Some(30),
+            sleep_timer_fading: true,
         };
         let value = serde_json::to_value(status).unwrap();
 
@@ -4921,6 +5025,8 @@ mod tests {
         assert_eq!(value["screensaver_active"], true);
         assert_eq!(value["carousel_cover_count"], 12);
         assert_eq!(value["carousel_speed"], 28.0);
+        assert_eq!(value["sleep_timer_remaining_seconds"], 30);
+        assert_eq!(value["sleep_timer_fading"], true);
         assert!(value.get("artwork_path").is_none());
         assert!(value["next_artist"].is_null());
     }
@@ -5159,6 +5265,8 @@ mod tests {
             screensaver_active: false,
             carousel_cover_count: 8,
             carousel_speed: 20.0,
+            sleep_timer_remaining_seconds: None,
+            sleep_timer_fading: false,
         }));
 
         let first_response = http_get("/api/status", Arc::clone(&playback));
@@ -5190,6 +5298,8 @@ mod tests {
             screensaver_active: true,
             carousel_cover_count: 11,
             carousel_speed: 40.0,
+            sleep_timer_remaining_seconds: Some(900),
+            sleep_timer_fading: false,
         };
 
         let second_response = http_get("/api/status", playback);
@@ -5233,6 +5343,8 @@ mod tests {
             screensaver_active: false,
             carousel_cover_count: 13,
             carousel_speed: 35.0,
+            sleep_timer_remaining_seconds: Some(45),
+            sleep_timer_fading: true,
         }));
         let queue = Arc::new(Mutex::new(vec![
             MopidyQueueTrack {
@@ -5290,6 +5402,8 @@ mod tests {
         assert_eq!(status["position_ms"], 183_421);
         assert_eq!(status["progress_percent"], 42.96);
         assert_eq!(status["volume_percent"], 44);
+        assert_eq!(status["sleep_timer_remaining_seconds"], 45);
+        assert_eq!(status["sleep_timer_fading"], true);
         assert_eq!(status["clients"], 0);
         assert_eq!(status["queue_length"], 2);
         assert_eq!(status["queue_upcoming"], 1);
@@ -5456,7 +5570,8 @@ mod tests {
         assert!(body.contains("volume.addEventListener('change'"));
         assert!(body.contains("window.clearTimeout(volumeTimer)"));
         assert!(body.contains("commitWebVolume(target), 120"));
-        assert!(body.contains("action !== 'screensaver'"));
+        assert!(body.contains("['screensaver', 'sleep_cancel'].includes(action)"));
+        assert!(body.contains("playback.sleep_timer_remaining_seconds"));
         assert!(body.contains("document.addEventListener('keydown'"));
         assert!(body.contains("fetch(quickPlaylistForm.action"));
         assert!(body.contains("playlistSelect.replaceChildren()"));
@@ -5755,8 +5870,8 @@ mod tests {
         let html = playback_card(&WebPlaybackStatus::default(), "token", true);
 
         assert!(html.contains("Mopidy unavailable"));
-        assert_eq!(html.matches("data-playback-control").count(), 5);
-        assert_eq!(html.matches(" disabled").count(), 5);
+        assert_eq!(html.matches("data-playback-control").count(), 10);
+        assert_eq!(html.matches(" disabled").count(), 10);
         let screen_button = html
             .split("id=\"toggle-screen\"")
             .nth(1)

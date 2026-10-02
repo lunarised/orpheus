@@ -4,6 +4,7 @@ use crate::history::{HistoryEntry, HistoryStore};
 use crate::mopidy::{MopidyClient, MopidyCommand, MopidySnapshot, PlaybackState};
 use crate::news::{NewsData, NewsUpdate};
 use crate::playlists::Track;
+use crate::sleep_timer::SleepTimer;
 use crate::spotifyd::{SpotifydCommand, SpotifydPlaybackState, SpotifydSnapshot, SpotifydUpdate};
 use crate::weather::{WeatherData, WeatherUpdate};
 use crate::web_config::{
@@ -259,6 +260,8 @@ pub struct AppState {
     settings_path: Option<PathBuf>,
     last_volume_command: Option<(u8, Instant)>,
     volume_save_due: Option<Instant>,
+    sleep_timer: Option<SleepTimer>,
+    sleep_timer_last_reported_seconds: Option<u64>,
 
     // UI mode
     pub ui_mode: UiMode,
@@ -394,6 +397,8 @@ impl AppState {
             settings_path: Some(settings_path),
             last_volume_command: None,
             volume_save_due: None,
+            sleep_timer: None,
+            sleep_timer_last_reported_seconds: None,
             ui_mode: UiMode::NowPlaying,
             menu_index: 0,
             picker_index: 0,
@@ -1092,6 +1097,8 @@ impl AppState {
             self.current_time += dt;
         }
 
+        self.update_sleep_timer_at(Instant::now());
+
         // Advance marquee scroll
         self.offset += 2;
         if self.ui_mode == UiMode::Screensaver {
@@ -1231,6 +1238,8 @@ impl AppState {
                 WebPlaybackAction::Seek(position_seconds) => self.seek_to(position_seconds),
                 WebPlaybackAction::SetVolume(volume) => self.set_volume(volume),
                 WebPlaybackAction::ToggleScreensaver => self.toggle_screensaver_preview(),
+                WebPlaybackAction::StartSleepTimer(minutes) => self.start_sleep_timer(minutes),
+                WebPlaybackAction::CancelSleepTimer => self.cancel_sleep_timer(),
             },
         }
     }
@@ -1263,6 +1272,14 @@ impl AppState {
             screensaver_active: self.ui_mode == UiMode::Screensaver,
             carousel_cover_count: self.screensaver_art_paths.len(),
             carousel_speed: self.settings.carousel_speed,
+            sleep_timer_remaining_seconds: self
+                .sleep_timer
+                .as_ref()
+                .map(|timer| timer.remaining_seconds(Instant::now())),
+            sleep_timer_fading: self
+                .sleep_timer
+                .as_ref()
+                .is_some_and(|timer| timer.is_fading(Instant::now())),
         };
     }
 
@@ -1629,6 +1646,9 @@ impl AppState {
 
     pub fn set_volume(&mut self, volume: u8) {
         let volume = volume.min(self.settings.max_volume);
+        if let Some(timer) = self.sleep_timer.as_mut() {
+            timer.set_base_volume(volume, Instant::now());
+        }
         self.dispatch_volume(volume);
         self.volume = Some(volume);
         self.settings.playback_volume = volume;
@@ -1638,6 +1658,94 @@ impl AppState {
             "Master volume: {volume}% (maximum {}%)",
             self.settings.max_volume
         );
+    }
+
+    pub fn start_sleep_timer(&mut self, minutes: u64) {
+        let minutes = minutes.clamp(1, 12 * 60);
+        let base_volume = self.volume.unwrap_or(self.settings.playback_volume);
+        self.sleep_timer = Some(SleepTimer::new(
+            Duration::from_secs(minutes.saturating_mul(60)),
+            base_volume,
+            Instant::now(),
+        ));
+        self.sleep_timer_last_reported_seconds = Some(minutes.saturating_mul(60));
+        self.publish_web_playback_status();
+        println!("Sleep timer started for {minutes} minutes");
+    }
+
+    pub fn cancel_sleep_timer(&mut self) {
+        let Some(timer) = self.sleep_timer.take() else {
+            return;
+        };
+        let restore_volume = timer.base_volume().min(self.settings.max_volume);
+        if self.volume != Some(restore_volume) {
+            self.dispatch_volume(restore_volume);
+            self.volume = Some(restore_volume);
+        }
+        self.sleep_timer_last_reported_seconds = None;
+        self.publish_web_playback_status();
+        println!("Sleep timer cancelled");
+    }
+
+    fn update_sleep_timer_at(&mut self, now: Instant) {
+        let Some(mut timer) = self.sleep_timer.take() else {
+            return;
+        };
+        let remaining = timer.remaining_seconds(now);
+        let tick = timer.tick(now);
+
+        if tick.expired {
+            self.pause_for_sleep_timer();
+            let restore_volume = timer.base_volume().min(self.settings.max_volume);
+            if self.volume != Some(restore_volume) {
+                // The pause and restore commands use the same per-backend
+                // queues, preserving their order and avoiding a loud tail.
+                self.dispatch_volume(restore_volume);
+                self.volume = Some(restore_volume);
+            }
+            self.sleep_timer_last_reported_seconds = None;
+            self.publish_web_playback_status();
+            println!("Sleep timer elapsed; playback paused");
+            return;
+        }
+
+        if let Some(volume) = tick.volume
+            && self.volume != Some(volume)
+        {
+            // Timer fades are deliberately transient: they do not overwrite
+            // the listener's persisted master volume.
+            self.dispatch_volume(volume);
+            self.volume = Some(volume);
+        }
+        self.sleep_timer = Some(timer);
+        if self.sleep_timer_last_reported_seconds != Some(remaining) || tick.volume.is_some() {
+            self.sleep_timer_last_reported_seconds = Some(remaining);
+            self.publish_web_playback_status();
+        }
+    }
+
+    fn pause_for_sleep_timer(&mut self) {
+        if !self.is_playing {
+            return;
+        }
+        let result = match self.active_source {
+            PlaybackSource::Mopidy => self
+                .mopidy_commands
+                .send(MopidyCommand::Pause)
+                .map_err(|error| error.to_string()),
+            PlaybackSource::Spotifyd => self
+                .spotifyd_commands
+                .send(SpotifydCommand::Pause)
+                .map_err(|error| error.to_string()),
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "Could not pause {} for sleep timer: {error}",
+                self.active_source.label()
+            );
+            return;
+        }
+        self.is_playing = false;
     }
 
     fn dispatch_volume(&mut self, volume: u8) {
@@ -1684,6 +1792,9 @@ impl AppState {
             // same value to Spotifyd can fight a phone while its slider moves.
             self.volume = Some(safe_volume);
             self.settings.playback_volume = safe_volume;
+            if let Some(timer) = self.sleep_timer.as_mut() {
+                timer.set_base_volume(safe_volume, Instant::now());
+            }
             self.volume_save_due = Some(Instant::now());
             match source {
                 PlaybackSource::Mopidy => {
@@ -2566,6 +2677,8 @@ impl AppState {
             settings_path: None,
             last_volume_command: None,
             volume_save_due: None,
+            sleep_timer: None,
+            sleep_timer_last_reported_seconds: None,
             ui_mode: UiMode::NowPlaying,
             menu_index: 0,
             picker_index: 0,
@@ -2801,6 +2914,36 @@ mod tests {
         let web_status = state.web_playback_status.lock().unwrap();
         assert!(web_status.is_playing);
         assert_eq!(web_status.volume, Some(42));
+    }
+
+    #[test]
+    fn sleep_timer_fades_pauses_and_restores_the_master_volume() {
+        let (mut state, commands, _updates) = AppState::new_for_test(Config::default());
+        state.volume = Some(60);
+        state.settings.playback_volume = 60;
+        state.is_playing = true;
+        let started_at = Instant::now();
+
+        state.apply_web_config_update(WebConfigUpdate::Playback(
+            WebPlaybackAction::StartSleepTimer(15),
+        ));
+        state.update_sleep_timer_at(started_at + Duration::from_secs(14 * 60 + 31));
+
+        let MopidyCommand::SetVolume(faded_volume) = commands.recv().unwrap() else {
+            panic!("expected final-minute volume fade");
+        };
+        assert!(faded_volume < 60);
+        assert!(state.is_playing);
+
+        state.update_sleep_timer_at(started_at + Duration::from_secs(16 * 60));
+
+        assert_eq!(commands.recv().unwrap(), MopidyCommand::Pause);
+        assert_eq!(commands.recv().unwrap(), MopidyCommand::SetVolume(60));
+        assert!(!state.is_playing);
+        assert_eq!(state.volume, Some(60));
+        let web_status = state.web_playback_status.lock().unwrap();
+        assert_eq!(web_status.sleep_timer_remaining_seconds, None);
+        assert!(!web_status.sleep_timer_fading);
     }
 
     #[test]

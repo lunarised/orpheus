@@ -6,7 +6,14 @@ also provides a desktop preview mode for development.
 
 The application includes playback controls, queue and playlist management,
 library browsing, playback history, album-art and clock screensavers, weather
-and morning information, Spotify Connect status, and a live web interface.
+and morning information, Spotify Connect status, a live web interface, and a
+sleep timer with a gentle final-minute fade for both playback sources.
+
+The authenticated web player offers 15, 30, 45, 60, and 90 minute sleep timer
+presets. When the timer expires Orpheus pauses whichever source is active, then
+restores the selected master volume so the next listening session does not
+start at the faded level. Timer state is also included in the live and public
+status APIs.
 
 ## Build and test
 
