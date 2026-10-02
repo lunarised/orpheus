@@ -8,6 +8,7 @@ mod mopidy;
 mod news;
 mod playlists;
 mod renderer;
+mod sleep_timer;
 mod spotifyd;
 mod state;
 mod text;
