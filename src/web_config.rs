@@ -116,7 +116,7 @@ const APP_JS: &str = r#"(() => {
   const playlistFilter = get('playlist-filter');
   const playlistSelect = get('playlist-select');
   const playlistCount = get('playlist-count');
-  const quickPlaylistPlay = get('quick-playlist-play');
+  const quickPlaylistQueue = get('quick-playlist-queue');
   const quickPlaylistCsrf = get('quick-playlist-csrf');
   const librarySearchForm = get('library-search-form');
   const librarySearchInput = get('library-search-input');
@@ -189,7 +189,9 @@ const APP_JS: &str = r#"(() => {
     });
     if (visible.some((playlist) => playlist.uri === previous)) playlistSelect.value = previous;
     if (playlistCount) playlistCount.textContent = query ? `${visible.length} of ${playlistCatalog.length}` : `${playlistCatalog.length} available`;
-    if (quickPlaylistPlay) quickPlaylistPlay.disabled = !latestPlayback.mopidy_online || visible.length === 0;
+    document.querySelectorAll('[data-playlist-action]').forEach((button) => {
+      button.disabled = !latestPlayback.mopidy_online || visible.length === 0;
+    });
   };
 
   const refreshPlaylists = async () => {
@@ -502,7 +504,9 @@ const APP_JS: &str = r#"(() => {
     toggle.textContent = playback.is_playing ? 'Pause' : 'Play';
     document.title = playback.title && playback.title !== 'No track playing' ? `${playback.title} — Orpheus` : 'Orpheus';
     setOnline(online, Boolean(playback.mopidy_online));
-    if (quickPlaylistPlay && playlistSelect) quickPlaylistPlay.disabled = !playback.mopidy_online || playlistSelect.options.length === 0;
+    if (playlistSelect) document.querySelectorAll('[data-playlist-action]').forEach((button) => {
+      button.disabled = !playback.mopidy_online || playlistSelect.options.length === 0;
+    });
     renderPosition(playback.position_seconds, playback.duration_seconds);
     updateArtwork(playback);
 
@@ -643,28 +647,42 @@ const APP_JS: &str = r#"(() => {
   artwork.addEventListener('error', () => { artworkWrap.hidden = true; });
 
   if (playlistFilter) playlistFilter.addEventListener('input', renderPlaylistOptions);
-  if (quickPlaylistForm && playlistSelect && quickPlaylistCsrf && quickPlaylistPlay) {
+  if (quickPlaylistForm && playlistSelect && quickPlaylistCsrf && quickPlaylistQueue) {
     quickPlaylistForm.addEventListener('submit', async (event) => {
       event.preventDefault();
       if (!latestPlayback.mopidy_online || !playlistSelect.value) return;
+      const name = requesterName ? requesterName.value.trim() : '';
+      if (!name) {
+        showFeedback('Enter your name before adding a playlist', true);
+        const changeName = get('change-client-name');
+        if (changeName) changeName.click();
+        return;
+      }
       const selected = playlistSelect.selectedOptions[0];
       const playlistName = selected && selected.dataset.name || selected && selected.textContent || 'playlist';
-      quickPlaylistPlay.disabled = true;
-      quickPlaylistPlay.textContent = 'Starting…';
+      const submitter = event.submitter || quickPlaylistQueue;
+      const endpoint = submitter.getAttribute('formaction') || quickPlaylistForm.action;
+      const replacingQueue = endpoint.endsWith('/library/play');
+      const originalLabel = submitter.textContent;
+      document.querySelectorAll('[data-playlist-action]').forEach((button) => { button.disabled = true; });
+      submitter.textContent = replacingQueue ? 'Starting…' : 'Adding…';
       try {
-        const response = await fetch(quickPlaylistForm.action, {
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: {'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded'},
-          body: new URLSearchParams({csrf: quickPlaylistCsrf.value, playlist_uri: playlistSelect.value})
+          body: new URLSearchParams({csrf: quickPlaylistCsrf.value, playlist_uri: playlistSelect.value, requester_name: name})
         });
         if (!response.ok) throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
-        showFeedback(`Starting ${playlistName}`);
+        showFeedback(replacingQueue ? `Starting ${playlistName}` : `Added ${playlistName} to the queue`);
         window.setTimeout(refresh, 300);
+        if (!replacingQueue) window.setTimeout(refreshQueue, 300);
       } catch (error) {
-        showFeedback(error.message || 'Could not start playlist', true);
+        showFeedback(error.message || 'Could not update the playlist queue', true);
       } finally {
-        quickPlaylistPlay.textContent = 'Play selected';
-        quickPlaylistPlay.disabled = !latestPlayback.mopidy_online || playlistSelect.options.length === 0;
+        submitter.textContent = originalLabel;
+        document.querySelectorAll('[data-playlist-action]').forEach((button) => {
+          button.disabled = !latestPlayback.mopidy_online || playlistSelect.options.length === 0;
+        });
       }
     });
   }
@@ -891,9 +909,9 @@ const PWA_JS: &str = r#"(() => {
 })();
 "#;
 
-const SERVICE_WORKER_JS: &str = r#"const CACHE_NAME = 'orpheus-shell-v9';
+const SERVICE_WORKER_JS: &str = r#"const CACHE_NAME = 'orpheus-shell-v10';
 const SHELL_ASSETS = [
-  '/app.js?v=9',
+  '/app.js?v=10',
   '/identity.js?v=1',
   '/settings.js',
   '/pwa.js',
@@ -954,6 +972,10 @@ pub enum WebConfigUpdate {
     Settings(Settings),
     Playlists(Config),
     PlayPlaylist(PlaylistEntry),
+    QueuePlaylist {
+        entry: PlaylistEntry,
+        requested_by: Option<String>,
+    },
     Playback(WebPlaybackAction),
     QueueTrack {
         uri: String,
@@ -1210,7 +1232,7 @@ fn dispatch_request_for_client<W: Write>(
             stream,
             403,
             "Forbidden",
-            "Guest mode only allows adding a searched song to the end of the queue\n",
+            "Guest mode only allows play/pause, volume, and adding music to the end of the queue\n",
         );
     }
 
@@ -1558,6 +1580,39 @@ fn dispatch_request_for_client<W: Write>(
                     400,
                     "Bad Request",
                     &format!("Playlist was not started: {error}\n"),
+                ),
+            }
+        }
+        ("POST", "/library/queue") => {
+            let guest_policy = guest_restricted.then_some(GuestQueuePolicy {
+                client_id,
+                cooldown: Duration::from_secs(access_settings.guest_queue_cooldown_seconds),
+                attempts: &server.guest_queue_attempts,
+            });
+            match send_catalog_playlist_queue_request(
+                &request,
+                csrf_token,
+                updates,
+                playlist_catalog,
+                guest_policy,
+            ) {
+                Ok(()) if accepts_json(&request) => {
+                    respond_json(stream, 202, "Accepted", "{\"ok\":true}")
+                }
+                Ok(()) => respond_redirect(stream, "/?sent=playlist-queued"),
+                Err(error) => respond_text(
+                    stream,
+                    if error.starts_with("guest queue cooldown active") {
+                        429
+                    } else {
+                        400
+                    },
+                    if error.starts_with("guest queue cooldown active") {
+                        "Too Many Requests"
+                    } else {
+                        "Bad Request"
+                    },
+                    &format!("Playlist was not queued: {error}\n"),
                 ),
             }
         }
@@ -2166,6 +2221,40 @@ fn send_catalog_playlist_request(
             uri: playlist.uri,
             art_uri: None,
         }))
+        .map_err(|_| "display process is no longer accepting updates".to_string())
+}
+
+fn send_catalog_playlist_queue_request(
+    request: &HttpRequest,
+    csrf_token: &str,
+    updates: &Sender<WebConfigUpdate>,
+    playlist_catalog: &Arc<Mutex<Vec<WebPlaylist>>>,
+    guest_policy: Option<GuestQueuePolicy<'_>>,
+) -> Result<(), String> {
+    ensure_form_content_type(request)?;
+    let form = parse_form(&request.body)?;
+    validate_csrf(&form, csrf_token)?;
+    let uri = required(&form, "playlist_uri")?;
+    let playlist = playlist_catalog
+        .lock()
+        .map_err(|_| "playlist catalog is unavailable".to_string())?
+        .iter()
+        .find(|playlist| playlist.uri == uri)
+        .cloned()
+        .ok_or_else(|| "playlist is not in the current Mopidy catalog".to_string())?;
+    let requested_by = Some(validated_requester_name(&form)?);
+    if let Some(policy) = guest_policy.as_ref() {
+        enforce_guest_queue_cooldown(policy)?;
+    }
+    updates
+        .send(WebConfigUpdate::QueuePlaylist {
+            entry: PlaylistEntry {
+                name: playlist.name,
+                uri: playlist.uri,
+                art_uri: None,
+            },
+            requested_by,
+        })
         .map_err(|_| "display process is no longer accepting updates".to_string())
 }
 
@@ -2784,7 +2873,7 @@ label{display:grid;gap:7px;color:#cbd0dc;font-size:12px;font-weight:650}input,se
 button{border:0;border-radius:12px;background:linear-gradient(135deg,var(--accent),#bad4ff);color:#07101e;font:inherit;font-weight:800;padding:11px 18px;cursor:pointer;margin-top:18px;box-shadow:0 8px 22px rgba(78,125,194,.18);transition:transform .16s ease,filter .16s ease,opacity .16s}button:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.07)}button:active:not(:disabled){transform:translateY(0)}button:disabled{cursor:not-allowed;opacity:.42}.button-subtle{background:rgba(255,255,255,.07);box-shadow:none;color:#d8deec}.button-danger{background:rgba(255,103,126,.11);box-shadow:none;color:#ffabb7}
 .status{display:inline-flex;align-items:center;padding:6px 10px;border:1px solid rgba(115,226,167,.22);border-radius:999px;background:rgba(115,226,167,.08);color:var(--good);font-size:11px;font-weight:750}.status:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:7px;box-shadow:0 0 10px currentColor}.status.offline{color:var(--muted);border-color:var(--line);background:rgba(255,255,255,.03)}[hidden]{display:none!important}
 .now-playing-body{display:flex;align-items:center;gap:22px}.now-playing-details{flex:1;min-width:0}.album-art-wrap{width:148px;aspect-ratio:1;flex:0 0 148px;border-radius:18px;overflow:hidden;background:#0a0d14;border:1px solid var(--line);box-shadow:0 18px 45px rgba(0,0,0,.4)}.album-art{display:block;width:100%;height:100%;object-fit:cover}.track-title{font-size:27px;line-height:1.15;font-weight:820;letter-spacing:-.035em;margin:3px 0 7px}.track-meta{color:var(--muted)}.web-progress{height:8px;background:rgba(255,255,255,.09);border-radius:99px;overflow:hidden;margin-top:22px;cursor:pointer}.web-progress:focus-visible{outline:2px solid var(--accent);outline-offset:4px}.web-progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent-2));width:0;transition:width .25s linear;pointer-events:none}.playback-time{display:flex;justify-content:space-between;color:#747d91;font-size:11px;margin-top:7px}.next-track{color:#bbc2d2;font-size:12px;margin-top:12px}.controls{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:19px}.controls button{margin:0}.controls button:not(:nth-child(2)){background:rgba(255,255,255,.065);box-shadow:none;color:#dbe1ed}.volume-row{display:grid;grid-template-columns:1fr auto;align-items:end;gap:10px;margin-top:17px}.volume-row button{margin:0}.js .volume-row button{display:none}.display-tools{display:flex;align-items:center;gap:12px;margin-top:15px}.display-tools button{margin:0;background:rgba(138,180,248,.1);box-shadow:none;color:#cfe0ff}.display-tools span{color:var(--muted);font-size:11px}.command-feedback{min-height:18px;color:var(--good);font-size:12px;margin-top:10px}.command-feedback.error{color:var(--danger)}.shortcuts{font-size:10px;margin-top:2px}
-.notice{padding:12px 15px;border-radius:12px;background:rgba(115,226,167,.1);color:#aaf0c8;border:1px solid rgba(115,226,167,.22)}.playlist{border-top:1px solid var(--line);padding:17px 0 4px}.playlist:first-of-type{border-top:0;padding-top:0}.playlist-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.playlist-launch,.library-search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}.playlist-launch label+label{margin-top:12px}.playlist-launch button,.library-search-form button{margin:0;height:46px}.playlist-select{min-height:178px}.playlist-count{font-size:11px;color:var(--muted)}
+.notice{padding:12px 15px;border-radius:12px;background:rgba(115,226,167,.1);color:#aaf0c8;border:1px solid rgba(115,226,167,.22)}.playlist{border-top:1px solid var(--line);padding:17px 0 4px}.playlist:first-of-type{border-top:0;padding-top:0}.playlist-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.playlist-launch,.library-search-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}.playlist-launch label+label{margin-top:12px}.playlist-actions{display:flex;flex-direction:column;gap:10px}.playlist-launch button,.library-search-form button{margin:0;height:46px}.playlist-select{min-height:178px}.playlist-count{font-size:11px;color:var(--muted)}
 .search-results{display:grid;gap:8px;margin-top:14px}.search-result,.history-item{display:flex;align-items:center;justify-content:space-between;gap:14px}.search-result,.queue-item,.history-item{padding:13px;border:1px solid var(--line);border-radius:14px;background:rgba(5,8,14,.46)}.queue-item{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px}.queue-item.current{border-color:rgba(138,180,248,.5);background:rgba(138,180,248,.08)}.search-result-copy{display:grid;gap:4px;min-width:0}.queue-item-copy{width:100%;overflow:hidden}.search-result-copy strong,.search-result-copy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.search-result-copy span{color:var(--muted);font-size:11px}.search-actions,.queue-actions,.queue-controls{display:flex;align-items:center;gap:6px;flex:0 0 auto}.search-actions button,.queue-actions button,.browse-item{margin:0;padding:8px 10px;background:rgba(255,255,255,.07);box-shadow:none;color:#cfe0ff;font-size:11px}.search-actions button:first-child{background:linear-gradient(135deg,var(--accent),#bad4ff);color:#07101e}.browse-toolbar{display:grid;grid-template-columns:160px 1fr;gap:10px}.browse-items{display:flex;gap:7px;overflow:auto;padding:10px 0 3px}.browse-item{white-space:nowrap}.queue-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.queue-heading button{margin:0}.queue-list,.history-list{display:grid;gap:8px;margin-top:14px}.diagnostic-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.diagnostic{padding:14px;border:1px solid var(--line);border-radius:14px;background:rgba(5,8,14,.46)}.diagnostic span{display:block;color:var(--muted);font-size:11px}.diagnostic strong{display:block;margin-top:4px;font-size:17px}.hint{font-size:11px}.install-actions,.settings-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.install-actions button,.settings-actions button{margin:10px 0 0}.install-status{flex:1;min-width:220px}.security-note{display:flex;gap:12px;align-items:flex-start;padding:13px;border:1px solid rgba(138,180,248,.15);border-radius:13px;background:rgba(138,180,248,.055)}.security-note strong{display:block;margin-bottom:2px}.login-shell{width:min(430px,calc(100% - 32px));padding-top:9vh}.login-card{padding:28px}.login-card h2{font-size:25px;margin-bottom:6px}.login-card button{width:100%}.login-error{color:var(--danger);margin:12px 0}.footer{font-size:11px;text-align:center;margin-top:26px}.footer a{color:#aebddd}
 .queue-vote{flex:0 0 88px;width:88px;white-space:nowrap;margin:0;padding:8px 10px;box-shadow:none;color:var(--good);background:rgba(115,226,167,.08);font-size:11px}.client-identity{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:rgba(5,8,14,.42)}.client-identity span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.client-identity strong{display:block;margin-top:1px}.client-identity button{margin:0;padding:7px 10px;background:rgba(255,255,255,.07);box-shadow:none;color:#d8deec;font-size:11px}
 @media(display-mode:standalone){main{padding-top:max(24px,env(safe-area-inset-top));padding-bottom:max(32px,env(safe-area-inset-bottom))}}
@@ -2850,7 +2939,7 @@ fn render_player_page(
     if guest_restricted {
         let _ = write!(
             html,
-            "<input id=\"guest-mode\" type=\"hidden\"><div class=\"notice\">Guest mode: play/pause and volume are available. You may add one song every {} seconds; other controls require the settings login.</div>",
+            "<input id=\"guest-mode\" type=\"hidden\"><div class=\"notice\">Guest mode: play/pause and volume are available. You may add a song or preset playlist every {} seconds; other controls require the settings login.</div>",
             guest_cooldown_seconds
         );
     }
@@ -2861,14 +2950,13 @@ fn render_player_page(
     html.push_str(&library_search_card(playback.mopidy_online, csrf_token));
     html.push_str(&library_browser_card());
     html.push_str(&queue_editor_card(!guest_restricted));
-    if !guest_restricted {
-        html.push_str(&playlist_launcher(
-            playlists,
-            playback.mopidy_online,
-            csrf_token,
-        ));
-    }
-    html.push_str("<p class=\"footer\">Local multi-client player · <a href=\"/health\">health</a></p></main><script src=\"/app.js?v=9\" defer></script><script src=\"/pwa.js\" defer></script></body></html>");
+    html.push_str(&playlist_launcher(
+        playlists,
+        playback.mopidy_online,
+        csrf_token,
+        !guest_restricted,
+    ));
+    html.push_str("<p class=\"footer\">Local multi-client player · <a href=\"/health\">health</a></p></main><script src=\"/app.js?v=10\" defer></script><script src=\"/pwa.js\" defer></script></body></html>");
     html
 }
 
@@ -3339,7 +3427,12 @@ fn render_settings_page(
     html
 }
 
-fn playlist_launcher(playlists: &[WebPlaylist], online: bool, csrf_token: &str) -> String {
+fn playlist_launcher(
+    playlists: &[WebPlaylist],
+    online: bool,
+    csrf_token: &str,
+    can_replace_queue: bool,
+) -> String {
     let mut options = String::new();
     if playlists.is_empty() {
         options.push_str("<option value=\"\" disabled selected>Loading playlists…</option>");
@@ -3366,17 +3459,31 @@ fn playlist_launcher(playlists: &[WebPlaylist], online: bool, csrf_token: &str) 
     } else {
         " disabled"
     };
+    let play_button = if can_replace_queue {
+        format!(
+            "<button id=\"quick-playlist-play\" data-playlist-action data-mopidy-control type=\"submit\" formaction=\"/library/play\"{}>Play selected</button>",
+            disabled
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<section class=\"card\"><div class=\"playlist-launch-head\"><h2>Play a playlist</h2><span id=\"playlist-count\" class=\"playlist-count\">{} available</span></div>\
-         <form id=\"quick-playlist-form\" class=\"playlist-launch\" method=\"post\" action=\"/library/play\"><input id=\"quick-playlist-csrf\" type=\"hidden\" name=\"csrf\" value=\"{}\">\
+        "<section class=\"card\"><div class=\"playlist-launch-head\"><h2>Choose a playlist</h2><span id=\"playlist-count\" class=\"playlist-count\">{} available</span></div>\
+         <form id=\"quick-playlist-form\" class=\"playlist-launch\" method=\"post\" action=\"/library/queue\"><input id=\"quick-playlist-csrf\" type=\"hidden\" name=\"csrf\" value=\"{}\">\
          <div><label>Search<input id=\"playlist-filter\" type=\"search\" placeholder=\"Type a playlist name…\" autocomplete=\"off\"></label>\
          <label>Playlist<select id=\"playlist-select\" class=\"playlist-select\" name=\"playlist_uri\" size=\"7\" required>{}</select></label></div>\
-         <button id=\"quick-playlist-play\" data-mopidy-control type=\"submit\"{}>Play selected</button></form>\
-         <p class=\"hint\">Choosing a playlist replaces the queue. ★ favourites stay at the top; the full Mopidy catalog refreshes automatically.</p></section>",
+         <div class=\"playlist-actions\"><button id=\"quick-playlist-queue\" data-playlist-action data-mopidy-control type=\"submit\" formaction=\"/library/queue\"{}>Add to queue</button>{}</div></form>\
+         <p class=\"hint\">Add appends new tracks without interrupting playback.{} ★ favourites stay at the top; the full Mopidy catalog refreshes automatically.</p></section>",
         playlists.len(),
         escape_html(csrf_token),
         options,
-        disabled
+        disabled,
+        play_button,
+        if can_replace_queue {
+            " Play replaces the current queue."
+        } else {
+            ""
+        }
     )
 }
 
@@ -4657,7 +4764,11 @@ mod tests {
                 mopidy_online: true,
                 ..WebPlaybackStatus::default()
             })),
-            playlist_catalog: Arc::new(Mutex::new(Vec::new())),
+            playlist_catalog: Arc::new(Mutex::new(vec![WebPlaylist {
+                name: "Guest mix".to_string(),
+                uri: "test:playlist:guest-mix".to_string(),
+                favorite: true,
+            }])),
             library_search: test_library_search(),
             library_browse: test_library_browse(),
             library_lookup: test_library_lookup(),
@@ -4691,8 +4802,10 @@ mod tests {
         .unwrap();
         let page = String::from_utf8(page).unwrap();
         assert!(page.contains("id=\"guest-mode\""));
-        assert!(page.contains("one song every 120 seconds"));
-        assert!(!page.contains("id=\"quick-playlist-form\""));
+        assert!(page.contains("song or preset playlist every 120 seconds"));
+        assert!(page.contains("id=\"quick-playlist-form\""));
+        assert!(page.contains("id=\"quick-playlist-queue\""));
+        assert!(!page.contains("id=\"quick-playlist-play\""));
         assert!(!page.contains("id=\"queue-clear\""));
         assert!(page.contains("value=\"previous\" disabled>Previous"));
         assert!(page.contains("value=\"toggle\">Play"));
@@ -4738,6 +4851,55 @@ mod tests {
             String::from_utf8(repeated)
                 .unwrap()
                 .starts_with("HTTP/1.1 429 Too Many Requests\r\n")
+        );
+
+        let playlist_post = |target: &str| HttpRequest {
+            method: "POST".to_string(),
+            target: target.to_string(),
+            headers: HashMap::from([
+                (
+                    "content-type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+                ("accept".to_string(), "application/json".to_string()),
+            ]),
+            body:
+                b"csrf=test-csrf-token&playlist_uri=test%3Aplaylist%3Aguest-mix&requester_name=Sam"
+                    .to_vec(),
+        };
+        let mut queued_playlist = Vec::new();
+        dispatch_request_for_client(
+            &mut queued_playlist,
+            playlist_post("/library/queue"),
+            &server,
+            "192.0.2.11",
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(queued_playlist)
+                .unwrap()
+                .starts_with("HTTP/1.1 202 Accepted\r\n")
+        );
+        assert!(matches!(
+            received.recv().unwrap(),
+            WebConfigUpdate::QueuePlaylist {
+                requested_by: Some(name),
+                ..
+            } if name == "Sam"
+        ));
+
+        let mut replacing_playlist = Vec::new();
+        dispatch_request_for_client(
+            &mut replacing_playlist,
+            playlist_post("/library/play"),
+            &server,
+            "192.0.2.12",
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(replacing_playlist)
+                .unwrap()
+                .starts_with("HTTP/1.1 403 Forbidden\r\n")
         );
 
         let playback_post = |action: &str| HttpRequest {
@@ -4850,7 +5012,7 @@ mod tests {
         assert!(player_html.contains(">Wake display</button>"));
         assert!(player_html.contains("12 album covers ready · 35 px/s"));
         assert!(player_html.contains("id=\"playback-progress\""));
-        assert!(player_html.contains("src=\"/app.js?v=9\""));
+        assert!(player_html.contains("src=\"/app.js?v=10\""));
         assert!(player_html.contains("id=\"identity-gate\""));
         assert!(player_html.contains("id=\"client-name-label\""));
         assert!(player_html.contains("<main inert"));
@@ -5127,11 +5289,12 @@ mod tests {
             uri: "test:playlist:&danger".to_string(),
             favorite: true,
         };
-        let html = playlist_launcher(&[playlist], true, "token");
+        let html = playlist_launcher(&[playlist], true, "token", true);
 
         assert!(html.contains("id=\"playlist-filter\""));
         assert!(html.contains("id=\"playlist-select\""));
-        assert!(html.contains("action=\"/library/play\""));
+        assert!(html.contains("action=\"/library/queue\""));
+        assert!(html.contains("formaction=\"/library/play\""));
         assert!(html.contains("★ Rock &lt;&amp;&gt; Roll"));
         assert!(html.contains("value=\"test:playlist:&amp;danger\""));
         assert!(!html.contains("Rock <&> Roll"));
@@ -5354,8 +5517,8 @@ mod tests {
         let worker = http_get("/service-worker.js", Arc::clone(&playback));
         let (worker_headers, worker_body) = response_parts(&worker);
         assert!(worker_headers.contains("Service-Worker-Allowed: /"));
-        assert!(worker_body.contains("orpheus-shell-v9"));
-        assert!(worker_body.contains("'/app.js?v=9'"));
+        assert!(worker_body.contains("orpheus-shell-v10"));
+        assert!(worker_body.contains("'/app.js?v=10'"));
         assert!(worker_body.contains("'/identity.js?v=1'"));
         assert!(worker_body.contains("event.request.mode === 'navigate'"));
         assert!(worker_body.contains("url.pathname.startsWith('/api/')"));
@@ -5458,7 +5621,7 @@ mod tests {
         assert!(body.contains("commitWebVolume(target), 120"));
         assert!(body.contains("action !== 'screensaver'"));
         assert!(body.contains("document.addEventListener('keydown'"));
-        assert!(body.contains("fetch(quickPlaylistForm.action"));
+        assert!(body.contains("fetch(endpoint"));
         assert!(body.contains("playlistSelect.replaceChildren()"));
         assert!(body.contains("textContent"));
         assert!(!body.contains("innerHTML"));

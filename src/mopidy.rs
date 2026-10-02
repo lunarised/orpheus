@@ -112,6 +112,11 @@ pub enum MopidyCommand {
         display_name: String,
         shuffle: bool,
     },
+    QueuePlaylist {
+        uri: String,
+        display_name: String,
+        requested_by: Option<String>,
+    },
     QueueTrack {
         uri: String,
         placement: QueuePlacement,
@@ -221,7 +226,7 @@ impl MopidyClient {
     ) {
         let mut cached_art: Option<(String, String, String)> = None;
         let mut cached_next_track: Option<(u64, Option<MopidyTrackInfo>)> = None;
-        let mut cached_queue = Vec::new();
+        let mut cached_queue: Vec<MopidyQueueTrack> = Vec::new();
         let mut last_queue_refresh = Instant::now()
             .checked_sub(QUEUE_REFRESH_INTERVAL)
             .unwrap_or_else(Instant::now);
@@ -252,6 +257,25 @@ impl MopidyClient {
                     shuffle,
                 } => {
                     self.play_playlist_uri(&uri, &display_name, shuffle);
+                }
+                MopidyCommand::QueuePlaylist {
+                    uri,
+                    display_name,
+                    requested_by,
+                } => {
+                    let current_queue = self
+                        .try_get_queue(None)
+                        .unwrap_or_else(|| cached_queue.clone());
+                    let queued_uris = current_queue
+                        .iter()
+                        .map(|track| track.uri.as_str())
+                        .collect::<HashSet<_>>();
+                    let added_tlids = self.queue_playlist_uri(&uri, &display_name, &queued_uris);
+                    if let Some(requester) = requested_by {
+                        for tlid in added_tlids {
+                            queue_requesters.insert(tlid, requester.clone());
+                        }
+                    }
                 }
                 MopidyCommand::QueueTrack {
                     uri,
@@ -755,6 +779,43 @@ impl MopidyClient {
         Some(tlid)
     }
 
+    /// Append a playlist without interrupting playback or replacing the queue.
+    /// Tracks already present in the current queue, and duplicates within the
+    /// playlist itself, are omitted.
+    pub fn queue_playlist_uri(
+        &self,
+        uri: &str,
+        display_name: &str,
+        queued_uris: &HashSet<&str>,
+    ) -> Vec<u64> {
+        let playlist = self.rpc_call("core.playlists.lookup", Some(json!({ "uri": uri })));
+        let added = if let Some(playlist) = playlist
+            && playlist.get("tracks").and_then(Value::as_array).is_some()
+        {
+            let track_uris = unique_playlist_uris(&playlist, queued_uris);
+            if track_uris.is_empty() {
+                println!("Playlist '{display_name}' has no new tracks to queue");
+                return Vec::new();
+            }
+            self.rpc_call("core.tracklist.add", Some(json!({ "uris": track_uris })))
+        } else {
+            // Some Mopidy backends expand playlist URIs only when they are
+            // passed directly to tracklist.add.
+            self.rpc_call("core.tracklist.add", Some(json!({ "uris": [uri] })))
+        };
+        let Some(added) = added else {
+            eprintln!("Failed to queue playlist '{display_name}' ({uri})");
+            return Vec::new();
+        };
+        let tlids = tlids_from_tracklist(&added);
+        if tlids.is_empty() {
+            eprintln!("Mopidy added no tracks for playlist '{display_name}' ({uri})");
+        } else {
+            println!("Queued '{}' ({} tracks)", display_name, tlids.len());
+        }
+        tlids
+    }
+
     fn remove_queue_track(&self, tlid: u64) {
         self.rpc_call(
             "core.tracklist.remove",
@@ -1056,6 +1117,31 @@ fn parse_queue_tracks(value: &Value, current_tlid: Option<u64>) -> Vec<MopidyQue
         .collect()
 }
 
+fn unique_playlist_uris(playlist: &Value, queued_uris: &HashSet<&str>) -> Vec<String> {
+    let mut seen = queued_uris
+        .iter()
+        .map(|uri| (*uri).to_string())
+        .collect::<HashSet<_>>();
+    playlist
+        .get("tracks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|track| track.get("uri").and_then(Value::as_str))
+        .filter(|uri| seen.insert((*uri).to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn tlids_from_tracklist(value: &Value) -> Vec<u64> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("tlid").and_then(Value::as_u64))
+        .collect()
+}
+
 fn apply_queue_metadata(
     queue: &mut [MopidyQueueTrack],
     persisted: Option<&PersistentQueue>,
@@ -1256,6 +1342,39 @@ mod tests {
         assert_eq!(first_tlid_from_tracklist(&tracks), Some(42));
         assert_eq!(first_tlid_from_tracklist(&json!([])), None);
         assert_eq!(first_tlid_from_tracklist(&json!([{"track": {}}])), None);
+    }
+
+    #[test]
+    fn playlist_queueing_skips_existing_and_repeated_track_uris() {
+        let playlist = json!({
+            "tracks": [
+                {"uri": "jellyfin:track:existing"},
+                {"uri": "jellyfin:track:new"},
+                {"uri": "jellyfin:track:new"},
+                {"name": "Missing URI"},
+                {"uri": "jellyfin:track:another"}
+            ]
+        });
+        let queued = HashSet::from(["jellyfin:track:existing"]);
+
+        assert_eq!(
+            unique_playlist_uris(&playlist, &queued),
+            vec![
+                "jellyfin:track:new".to_string(),
+                "jellyfin:track:another".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn all_added_tracklist_ids_are_available_for_queue_attribution() {
+        let added = json!([
+            {"tlid": 41, "track": {"uri": "jellyfin:track:first"}},
+            {"tlid": 42, "track": {"uri": "jellyfin:track:second"}},
+            {"track": {"uri": "jellyfin:track:missing-id"}}
+        ]);
+
+        assert_eq!(tlids_from_tracklist(&added), vec![41, 42]);
     }
 
     #[test]
