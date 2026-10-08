@@ -11,6 +11,7 @@ pub enum ScreensaverStyle {
     #[default]
     Albums,
     Clock,
+    Pipes,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +38,7 @@ impl ScreensaverStyle {
         match self {
             Self::Albums => "Albums",
             Self::Clock => "Clock",
+            Self::Pipes => "3D pipes",
         }
     }
 }

@@ -1808,7 +1808,7 @@ fn collect_public_status(server: &WebServerState) -> PublicStatusSummary {
         healthy: playback.online,
         state,
         source: playback.source.clone(),
-        track: has_track.then(|| PublicStatusTrack {
+        track: has_track.then_some(PublicStatusTrack {
             title: playback.title,
             artist: playback.artist,
             album: playback.album,
@@ -2625,6 +2625,7 @@ fn settings_from_form(
     settings.screensaver_style = match required(form, "screensaver_style")? {
         "albums" => ScreensaverStyle::Albums,
         "clock" => ScreensaverStyle::Clock,
+        "pipes" => ScreensaverStyle::Pipes,
         _ => return Err("invalid screensaver style".to_string()),
     };
     settings.now_playing_style = match required(form, "now_playing_style")? {
@@ -3154,8 +3155,13 @@ fn render_settings_page(
             match settings.screensaver_style {
                 ScreensaverStyle::Albums => "albums",
                 ScreensaverStyle::Clock => "clock",
+                ScreensaverStyle::Pipes => "pipes",
             },
-            &[("albums", "Album carousel"), ("clock", "Clock + weather")]
+            &[
+                ("albums", "Album carousel"),
+                ("clock", "Clock + weather"),
+                ("pipes", "Classic 3D pipes"),
+            ]
         ),
         number_field(
             "Screensaver brightness (%)",
@@ -4068,6 +4074,15 @@ mod tests {
         );
         assert!(settings.guest_mode_enabled);
         assert_eq!(settings.guest_queue_cooldown_seconds, 120);
+
+        let mut pipes = form.clone();
+        pipes.insert("screensaver_style".to_string(), "pipes".to_string());
+        assert_eq!(
+            settings_from_form(Settings::default(), &pipes)
+                .unwrap()
+                .screensaver_style,
+            ScreensaverStyle::Pipes
+        );
 
         let mut track_info = form.clone();
         track_info.insert("now_playing_style".to_string(), "track_info".to_string());
@@ -5731,6 +5746,7 @@ mod tests {
         let html = render_settings_page(&Settings::default(), &config, "token", None);
 
         assert!(html.contains("value=\"Rock &amp; Roll\""));
+        assert!(html.contains("<option value=\"pipes\">Classic 3D pipes</option>"));
         assert!(!html.contains("data-playlist-play"));
         assert!(!html.contains("id=\"playback-form\""));
         assert_eq!(html.matches("<form").count(), 4);

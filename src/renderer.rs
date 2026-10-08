@@ -240,6 +240,9 @@ impl Renderer {
             UiMode::Screensaver => match state.settings.screensaver_style {
                 ScreensaverStyle::Albums => self.render_album_screensaver(state),
                 ScreensaverStyle::Clock => self.render_clock_screensaver(state),
+                ScreensaverStyle::Pipes => {
+                    crate::pipes::render(SCREEN_WIDTH, SCREEN_HEIGHT, state.screensaver_offset)
+                }
             },
             UiMode::Morning => self.render_morning_dashboard(state),
         }
