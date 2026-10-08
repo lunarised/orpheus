@@ -1095,7 +1095,11 @@ impl AppState {
         // Advance marquee scroll
         self.offset += 2;
         if self.ui_mode == UiMode::Screensaver {
-            self.screensaver_offset += dt * self.settings.carousel_speed;
+            self.screensaver_offset += match self.settings.screensaver_style {
+                ScreensaverStyle::Albums => dt * self.settings.carousel_speed,
+                ScreensaverStyle::Pipes => dt,
+                ScreensaverStyle::Clock => 0.0,
+            };
             if self.screensaver_offset > 1_000_000.0 {
                 self.screensaver_offset = 0.0;
             }
@@ -1386,7 +1390,7 @@ impl AppState {
             {
                 let screensaver_available = match self.settings.screensaver_style {
                     ScreensaverStyle::Albums => !self.screensaver_art_paths.is_empty(),
-                    ScreensaverStyle::Clock => true,
+                    ScreensaverStyle::Clock | ScreensaverStyle::Pipes => true,
                 };
                 if self.settings.screensaver_enabled && screensaver_available {
                     self.ui_mode = UiMode::Screensaver;
@@ -1813,7 +1817,8 @@ impl AppState {
             MenuItem::ScreensaverStyle => {
                 self.settings.screensaver_style = match self.settings.screensaver_style {
                     ScreensaverStyle::Albums => ScreensaverStyle::Clock,
-                    ScreensaverStyle::Clock => ScreensaverStyle::Albums,
+                    ScreensaverStyle::Clock => ScreensaverStyle::Pipes,
+                    ScreensaverStyle::Pipes => ScreensaverStyle::Albums,
                 };
                 self.persist_settings();
             }
@@ -3161,6 +3166,10 @@ mod tests {
         state.menu_index = 5;
         state.menu_select();
         assert_eq!(state.settings.screensaver_style, ScreensaverStyle::Clock);
+        state.menu_select();
+        assert_eq!(state.settings.screensaver_style, ScreensaverStyle::Pipes);
+        state.menu_select();
+        assert_eq!(state.settings.screensaver_style, ScreensaverStyle::Albums);
 
         state.menu_index = 6;
         state.menu_select();
@@ -3257,7 +3266,10 @@ mod tests {
     #[test]
     fn carousel_speed_controls_motion_and_zero_pauses_it() {
         let (mut state, _commands, _updates) = AppState::new_for_test(Config::default());
-        state.settings.screensaver_style = ScreensaverStyle::Clock;
+        state.settings.screensaver_style = ScreensaverStyle::Albums;
+        state
+            .screensaver_art_paths
+            .push("/tmp/example.jpg".to_string());
         state.settings.carousel_speed = 45.0;
         state.toggle_screensaver_preview();
 
@@ -3267,6 +3279,21 @@ mod tests {
         state.settings.carousel_speed = 0.0;
         state.advance_time(1.0);
         assert_eq!(state.screensaver_offset, 22.5);
+    }
+
+    #[test]
+    fn pipes_screensaver_animates_at_wall_clock_speed_without_cached_art() {
+        let (mut state, _commands, _updates) = AppState::new_for_test(Config::default());
+        state.settings.screensaver_style = ScreensaverStyle::Pipes;
+        state.settings.carousel_speed = 0.0;
+
+        state.toggle_screensaver_preview();
+        state.advance_time(0.5);
+        state.advance_time(0.25);
+
+        assert!(state.screensaver_art_paths.is_empty());
+        assert_eq!(state.ui_mode, UiMode::Screensaver);
+        assert_eq!(state.screensaver_offset, 0.75);
     }
 
     #[test]

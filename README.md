@@ -7,6 +7,9 @@ also provides a desktop preview mode for development.
 The application includes playback controls, queue and playlist management,
 library browsing, playback history, album-art and clock screensavers, weather
 and morning information, Spotify Connect status, and a live web interface.
+Its idle displays include a procedural recreation of the classic 3D Pipes
+screensaver, rendered locally with perspective, shaded tubes, and rounded
+elbow joints.
 
 ## Build and test
 

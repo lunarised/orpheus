@@ -6,6 +6,7 @@ mod display;
 mod history;
 mod mopidy;
 mod news;
+mod pipes;
 mod playlists;
 mod renderer;
 mod spotifyd;
