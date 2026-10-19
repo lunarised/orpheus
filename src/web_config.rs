@@ -1808,7 +1808,7 @@ fn collect_public_status(server: &WebServerState) -> PublicStatusSummary {
         healthy: playback.online,
         state,
         source: playback.source.clone(),
-        track: has_track.then(|| PublicStatusTrack {
+        track: has_track.then_some(PublicStatusTrack {
             title: playback.title,
             artist: playback.artist,
             album: playback.album,
@@ -3013,20 +3013,12 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn format_unix_time(seconds: u64) -> String {
-    let timestamp = seconds as libc::time_t;
-    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
-    let result = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
-    if result.is_null() {
+    let Some(local) = crate::local_time::LocalDateTime::from_unix(seconds) else {
         return seconds.to_string();
-    }
-    let local = unsafe { local.assume_init() };
+    };
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}",
-        local.tm_year + 1900,
-        local.tm_mon + 1,
-        local.tm_mday,
-        local.tm_hour,
-        local.tm_min
+        local.year, local.month, local.day, local.hour, local.minute
     )
 }
 
